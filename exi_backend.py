@@ -29,20 +29,13 @@ class LeakcheckHandler(BaseHTTPRequestHandler):
             self.handle_leakcheck(parsed)
         elif parsed.path == "/snusbase":
             self.handle_snusbase(parsed)
+        elif parsed.path == "/search":
+            self.handle_combined(parsed)
         else:
             self._send_json(404, {"success": False, "error": "not_found"})
 
-    def handle_leakcheck(self, parsed):
-        params = parse.parse_qs(parsed.query)
-        query = (params.get("q") or [""])[0].strip()
-        q_type = (params.get("type") or ["username"])[0].strip() or "username"
-
-        if not query:
-            self._send_json(400, {"success": False, "error": "missing_query"})
-            return
-
+    def get_leakcheck_data(self, query, q_type):
         url = f"https://leakcheck.io/api/v2/query/{query}?type={q_type}"
-
         req = request.Request(
             url,
             headers={
@@ -52,55 +45,15 @@ class LeakcheckHandler(BaseHTTPRequestHandler):
             },
             method="GET",
         )
-
         try:
-            resp = request.urlopen(req, timeout=15)
-            body_bytes = resp.read()
-            status = resp.getcode() or 200
-        except error.HTTPError as e:
-            body_bytes = e.read()
-            status = e.code or 500
+            resp = request.urlopen(req, timeout=10)
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            return data.get("result", []) if data.get("success") else []
         except Exception as e:
-            self._send_json(
-                502,
-                {
-                    "success": False,
-                    "error": "backend_error",
-                    "detail": str(e),
-                },
-            )
-            return
+            print(f"LeakCheck error: {e}")
+            return []
 
-        body_text = body_bytes.decode("utf-8", errors="replace")
-        try:
-            data = json.loads(body_text)
-        except Exception:
-            self._send_json(
-                status,
-                {
-                    "success": False,
-                    "error": "upstream_non_json",
-                    "status": status,
-                    "body": body_text[:400],
-                },
-            )
-            return
-
-        self._send_json(status, data)
-
-    def handle_snusbase(self, parsed):
-        params = parse.parse_qs(parsed.query)
-        query = (params.get("q") or [""])[0].strip()
-        q_type = (params.get("type") or ["username"])[0].strip() or "username"
-
-        if not query:
-            self._send_json(400, {"success": False, "error": "missing_query"})
-            return
-
-        # Map 'username' to 'username'/'email' for Snusbase?
-        # Snusbase types: 'email', 'username', 'ip', 'hash', 'password', 'name'
-        # LeakCheck types: 'username', 'email', 'keyword', 'domain'
-        
+    def get_snusbase_data(self, query, q_type):
         sb_type = "email" if "@" in query else "username"
         if q_type == "email": sb_type = "email"
         elif q_type == "username": sb_type = "username"
@@ -111,11 +64,9 @@ class LeakcheckHandler(BaseHTTPRequestHandler):
             "wildcard": False
         }
         
-        data_json = json.dumps(body).encode("utf-8")
-
         req = request.Request(
             SNUSBASE_API_URL,
-            data=data_json,
+            data=json.dumps(body).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "Auth": SNUSBASE_API_KEY_SECONDARY,
@@ -125,42 +76,73 @@ class LeakcheckHandler(BaseHTTPRequestHandler):
         )
 
         try:
-            resp = request.urlopen(req, timeout=15)
-            body_bytes = resp.read()
-            status = resp.getcode() or 200
-        except error.HTTPError as e:
-            body_bytes = e.read()
-            status = e.code or 500
-        except Exception as e:
-            self._send_json(502, {"success": False, "error": "backend_error", "detail": str(e)})
-            return
-
-        body_text = body_bytes.decode("utf-8", errors="replace")
-        try:
-            sb_data = json.loads(body_text)
-        except Exception:
-            self._send_json(status, {"success": False, "error": "upstream_non_json", "status": status, "body": body_text[:400]})
-            return
+            resp = request.urlopen(req, timeout=10)
+            sb_data = json.loads(resp.read().decode("utf-8", errors="replace"))
             
-        # Convert Snusbase response to LeakCheck format
-        results = []
-        if "results" in sb_data and isinstance(sb_data["results"], dict):
-             for term, entries in sb_data["results"].items():
-                for entry in entries:
-                    results.append({
-                        "line": f"{entry.get('username','')}:{entry.get('password','')}",
-                        "source": {"name": entry.get("database_name", "Unknown")},
-                        "username": entry.get("username", ""),
-                        "email": entry.get("email", ""),
-                        "password": entry.get("password", "")
-                    })
+            results = []
+            if "results" in sb_data and isinstance(sb_data["results"], dict):
+                for term, entries in sb_data["results"].items():
+                    for entry in entries:
+                        results.append({
+                            "line": f"{entry.get('username','')}:{entry.get('password','')}",
+                            "source": {"name": entry.get("database_name", "Unknown")},
+                            "username": entry.get("username", ""),
+                            "email": entry.get("email", ""),
+                            "password": entry.get("password", "")
+                        })
+            return results
+        except Exception as e:
+            print(f"Snusbase error: {e}")
+            return []
 
-        response_data = {
-            "success": True,
-            "result": results
-        }
+    def handle_combined(self, parsed):
+        params = parse.parse_qs(parsed.query)
+        query = (params.get("q") or [""])[0].strip()
+        q_type = (params.get("type") or ["username"])[0].strip() or "username"
+
+        if not query:
+            self._send_json(400, {"success": False, "error": "missing_query"})
+            return
+
+        # Fetch from both in parallel threads to be faster, or sequential for simplicity
+        # Sequential is safer for now to avoid complexity
+        lc_results = self.get_leakcheck_data(query, q_type)
+        sb_results = self.get_snusbase_data(query, q_type)
         
-        self._send_json(200, response_data)
+        combined = lc_results + sb_results
+        
+        self._send_json(200, {
+            "success": True,
+            "result": combined,
+            "meta": {
+                "leakcheck_count": len(lc_results),
+                "snusbase_count": len(sb_results)
+            }
+        })
+
+    def handle_leakcheck(self, parsed):
+        params = parse.parse_qs(parsed.query)
+        query = (params.get("q") or [""])[0].strip()
+        q_type = (params.get("type") or ["username"])[0].strip() or "username"
+
+        if not query:
+            self._send_json(400, {"success": False, "error": "missing_query"})
+            return
+
+        results = self.get_leakcheck_data(query, q_type)
+        self._send_json(200, {"success": True, "result": results})
+
+    def handle_snusbase(self, parsed):
+        params = parse.parse_qs(parsed.query)
+        query = (params.get("q") or [""])[0].strip()
+        q_type = (params.get("type") or ["username"])[0].strip() or "username"
+
+        if not query:
+            self._send_json(400, {"success": False, "error": "missing_query"})
+            return
+
+        results = self.get_snusbase_data(query, q_type)
+        self._send_json(200, {"success": True, "result": results})
 
 
 def run(host=None, port=None):
