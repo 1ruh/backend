@@ -44,6 +44,10 @@ class LeakcheckHandler(BaseHTTPRequestHandler):
         return any(k in source_name for k in STEALER_KEYWORDS)
 
     def get_leakcheck_data(self, query, q_type):
+        # Do not use LeakCheck for password searches
+        if q_type == "password":
+            return []
+
         url = f"https://leakcheck.io/api/v2/query/{query}?type={q_type}"
         req = request.Request(
             url,
@@ -102,6 +106,7 @@ class LeakcheckHandler(BaseHTTPRequestHandler):
         sb_type = "email" if "@" in query else "username"
         if q_type == "email": sb_type = "email"
         elif q_type == "username": sb_type = "username"
+        elif q_type == "password": sb_type = "password"
 
         body = {
             "terms": [query],
