@@ -9,6 +9,10 @@ LEAKCHECK_API_KEY = "4344cd645b6e6cc2559c1a92017d9bfa12e4e4b1"
 SNUSBASE_API_KEY_SECONDARY = "sby0b7crta98od7efbb8zr70788n2h"
 SNUSBASE_API_URL = "https://api.snusbase.com/data/search"
 
+STEALER_KEYWORDS = [
+    "stealer", "stealerlogs", "logs", "logz", 
+    "grabber", "clipper", "redline", "raccoon", "brute-logs"
+]
 
 class LeakcheckHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -34,6 +38,11 @@ class LeakcheckHandler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"success": False, "error": "not_found"})
 
+    def is_stealer(self, source_name):
+        if not source_name: return False
+        source_name = source_name.lower()
+        return any(k in source_name for k in STEALER_KEYWORDS)
+
     def get_leakcheck_data(self, query, q_type):
         url = f"https://leakcheck.io/api/v2/query/{query}?type={q_type}"
         req = request.Request(
@@ -48,7 +57,43 @@ class LeakcheckHandler(BaseHTTPRequestHandler):
         try:
             resp = request.urlopen(req, timeout=10)
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            return data.get("result", []) if data.get("success") else []
+            results = data.get("result", []) if data.get("success") else []
+            
+            # Filter for stealer logs in LeakCheck results
+            filtered = []
+            for r in results:
+                # Check source names in LeakCheck (usually list of sources)
+                sources = r.get("sources", [])
+                # If sources is a list of strings
+                is_stealer_log = False
+                for src in sources:
+                    if self.is_stealer(src):
+                        is_stealer_log = True
+                        break
+                
+                # Also check 'source' object if structure differs
+                if not is_stealer_log and "source" in r:
+                    src_obj = r["source"]
+                    if isinstance(src_obj, dict) and self.is_stealer(src_obj.get("name")):
+                        is_stealer_log = True
+
+                if is_stealer_log:
+                    # Map origin/source to 'url' for UI compatibility
+                    # Try to find specific origin URL/domain first
+                    origin = r.get("url") or r.get("domain") or r.get("site") or ""
+                    
+                    if not origin:
+                        # Fallback to source name
+                        if "source" in r and isinstance(r["source"], dict):
+                            origin = r["source"].get("name", "")
+                        elif sources:
+                             # Use the first source name found if available
+                            origin = sources[0] if sources else ""
+                    
+                    r["url"] = origin
+                    filtered.append(r)
+            
+            return filtered
         except Exception as e:
             print(f"LeakCheck error: {e}")
             return []
@@ -82,13 +127,21 @@ class LeakcheckHandler(BaseHTTPRequestHandler):
             results = []
             if "results" in sb_data and isinstance(sb_data["results"], dict):
                 for term, entries in sb_data["results"].items():
+                    # Check if database name (term) indicates a stealer log
+                    if not self.is_stealer(term):
+                        continue
+
                     for entry in entries:
+                        # Extract URL/Origin if available
+                        origin_url = entry.get("url") or entry.get("site") or entry.get("origin") or entry.get("domain") or entry.get("_domain") or ""
+                        
                         results.append({
                             "line": f"{entry.get('username','')}:{entry.get('password','')}",
-                            "source": {"name": entry.get("database_name", "Unknown")},
+                            "source": {"name": term}, # Use the database name as source
                             "username": entry.get("username", ""),
                             "email": entry.get("email", ""),
-                            "password": entry.get("password", "")
+                            "password": entry.get("password", ""),
+                            "url": origin_url # Include the URL
                         })
             return results
         except Exception as e:
